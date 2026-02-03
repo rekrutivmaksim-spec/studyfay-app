@@ -1,0 +1,126 @@
+name: RuStore Signed AAB (Studyfay)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-aab:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm ci || npm install
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Create Android project
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Fix Java version in Gradle (just in case)
+        run: |
+          find android -name "build.gradle*" -exec sed -i 's/JavaVersion.VERSION_21/JavaVersion.VERSION_17/g' {} + || true
+          find android -name "build.gradle*" -exec sed -i 's/sourceCompatibility = 21/sourceCompatibility = 17/g' {} + || true
+          find android -name "build.gradle*" -exec sed -i 's/targetCompatibility = 21/targetCompatibility = 17/g' {} + || true
+
+      - name: Prepare signing files
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p android/app
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.jks
+          cat > android/key.properties <<EOF
+          storeFile=app/release.jks
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      - name: Inject signing config into Gradle
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("android/app/build.gradle")
+          txt = p.read_text(encoding="utf-8", errors="ignore")
+
+          # ensure Properties + loader
+          if "keystorePropertiesFile" not in txt:
+              loader = (
+                  "\nimport java.util.Properties\n\n"
+                  "def keystorePropertiesFile = rootProject.file('key.properties')\n"
+                  "def keystoreProperties = new Properties()\n"
+                  "if (keystorePropertiesFile.exists()) {\n"
+                  "    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n"
+                  "}\n\n"
+              )
+              m = re.search(r"\nandroid\s*\{", txt)
+              if m:
+                  txt = txt[:m.start()] + loader + txt[m.start():]
+              else:
+                  txt = loader + txt
+
+          # insert signingConfigs if missing
+          if "signingConfigs" not in txt:
+              txt = re.sub(
+                  r"(android\s*\{\s*)",
+                  r"\1\n    signingConfigs {\n        release {\n            if (keystorePropertiesFile.exists()) {\n                storeFile file(keystoreProperties['storeFile'])\n                storePassword keystoreProperties['storePassword']\n                keyAlias keystoreProperties['keyAlias']\n                keyPassword keystoreProperties['keyPassword']\n            }\n        }\n    }\n",
+                  txt,
+                  count=1,
+                  flags=re.S
+              )
+
+          # ensure release buildType has signingConfig
+          def ensure_signing_in_release(block: str) -> str:
+              if "signingConfig signingConfigs.release" in block:
+                  return block
+              return re.sub(r"(release\s*\{\s*)", r"\1\n            signingConfig signingConfigs.release\n", block, count=1)
+
+          # patch first buildTypes{...} occurrence
+          m = re.search(r"buildTypes\s*\{[\s\S]*?\}", txt)
+          if m:
+              bt = m.group(0)
+              bt2 = re.sub(r"release\s*\{[\s\S]*?\}", lambda mm: ensure_signing_in_release(mm.group(0)), bt, count=1)
+              txt = txt[:m.start()] + bt2 + txt[m.end():]
+
+          p.write_text(txt, encoding="utf-8")
+          print("Gradle signing patched.")
+          PY
+
+      - name: Grant execute permission
+        run: chmod +x android/gradlew
+
+      - name: Build signed AAB
+        run: cd android && ./gradlew bundleRelease --no-daemon
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: studyfay-release-aab
+          path: android/app/build/outputs/bundle/release/*.aab
+          retention-days: 7
